@@ -116,10 +116,14 @@ func newConfig(options ...rotatingFileWriterOption) (cfg config, err error) {
 	}
 
 	// Ensure default for fileSizeMaxKb
-	cfg.FileSizeMaxKb = max(defaultFileSizeMaxKb, cfg.FileSizeMaxKb)
+	if cfg.FileSizeMaxKb <= 0 {
+		cfg.FileSizeMaxKb = defaultFileSizeMaxKb
+	}
 
 	// Ensure default for fileCountMax
-	cfg.FileCountMax = max(defaultFileCountMax, cfg.FileCountMax)
+	if cfg.FileCountMax <= 0 {
+		cfg.FileCountMax = defaultFileCountMax
+	}
 
 	return
 }
@@ -310,7 +314,7 @@ func removeOldFiles(base *rotatingFileWriterImpl) error {
 	nFiles := len(logFiles)
 	if nFiles > int(base.FileCountMax) {
 		numToRemove := nFiles - int(base.FileCountMax)
-		for _, filePath := range logFiles[:numToRemove-1] {
+		for _, filePath := range logFiles[:numToRemove] {
 			err := os.Remove(filePath)
 			if err != nil {
 				return err

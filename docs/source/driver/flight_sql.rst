@@ -192,6 +192,62 @@ The options used for creating the Flight RPC client can be customized.
 
     Python: :attr:`adbc_driver_flightsql.DatabaseOptions.WITH_COOKIE_MIDDLEWARE`
 
+Observability
+-------------
+
+The Go Flight SQL driver can emit structured JSON logs and OpenTelemetry trace
+spans when configured on :c:struct:`AdbcDatabase` before initialization. Explicit
+options take precedence over environment variables.
+
+Log options:
+
+``adbc.flight.sql.client_option.logging.level``
+    One of ``off``, ``error``, ``warn``, ``info``, ``debug``, or ``trace``.
+    The ``trace`` log level is the most detailed log level and is separate from
+    OpenTelemetry trace spans. Environment fallback:
+    ``ADBC_DRIVER_FLIGHTSQL_LOG_LEVEL``.
+
+``adbc.flight.sql.client_option.logging.sink``
+    One of ``stderr`` or ``file``. Environment fallback:
+    ``ADBC_DRIVER_FLIGHTSQL_LOG_SINK``.
+
+``adbc.flight.sql.client_option.logging.file.location``
+    Directory for rotating JSONL log files when the sink is ``file``. Environment
+    fallback: ``ADBC_DRIVER_FLIGHTSQL_LOG_FILE_LOCATION``.
+
+``adbc.flight.sql.client_option.logging.file.prefix``
+    File name prefix for rotating JSONL log files. Environment fallback:
+    ``ADBC_DRIVER_FLIGHTSQL_LOG_FILE_PREFIX``.
+
+``adbc.flight.sql.client_option.logging.file.max_size_kb``
+    Maximum size of each log file in KiB before rotation. Environment fallback:
+    ``ADBC_DRIVER_FLIGHTSQL_LOG_FILE_MAX_SIZE_KB``.
+
+``adbc.flight.sql.client_option.logging.file.max_files``
+    Maximum number of log files to retain. Environment fallback:
+    ``ADBC_DRIVER_FLIGHTSQL_LOG_FILE_MAX_FILES``.
+
+Trace options:
+
+``adbc.traces.exporter``
+    OpenTelemetry trace exporter. Supported values are ``none``, ``console``,
+    ``otlp``, and ``adbcfile``. If unset, the Go driver falls back to
+    ``OTEL_TRACES_EXPORTER``.
+
+``adbc.traces.exporter.adbcfile.location``
+    Directory for rotating JSONL trace files when ``adbc.traces.exporter`` is
+    ``adbcfile``.
+
+``adbc.traces.exporter.adbcfile.maxtracesizekb``
+    Maximum size of each trace file in KiB before rotation.
+
+``adbc.traces.exporter.adbcfile.maxtracefiles``
+    Maximum number of trace files to retain.
+
+When tracing is enabled, Flight SQL ADBC operations and gRPC client calls emit
+OpenTelemetry spans. gRPC-Go internal process-global logs are not enabled by
+these options.
+
 Custom Call Headers
 -------------------
 

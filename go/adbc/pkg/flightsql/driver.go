@@ -52,6 +52,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"runtime"
@@ -77,6 +78,7 @@ var globalPoison atomic.Bool
 
 const errPrefix = "[FlightSQL] "
 const logLevelEnvVar = "ADBC_DRIVER_FLIGHTSQL_LOG_LEVEL"
+const logLevelTrace = slog.LevelDebug - 4
 
 func setErr(err *C.struct_AdbcError, format string, vals ...interface{}) {
 	if err == nil {
@@ -197,8 +199,15 @@ func poison(err *C.struct_AdbcError, fname string, e interface{}) C.AdbcStatusCo
 
 // Check environment variables and enable logging if possible.
 func initLoggingFromEnv(db adbc.Database) {
+	if configured, ok := db.(adbc.DatabaseLoggingConfigured); ok && configured.IsLoggerConfigured() {
+		return
+	}
+
 	logLevel := slog.LevelError
+	writer := io.Writer(os.Stderr)
 	switch strings.ToLower(os.Getenv(logLevelEnvVar)) {
+	case "trace":
+		logLevel = logLevelTrace
 	case "debug":
 		logLevel = slog.LevelDebug
 	case "info":
@@ -208,6 +217,8 @@ func initLoggingFromEnv(db adbc.Database) {
 		logLevel = slog.LevelWarn
 	case "error":
 		logLevel = slog.LevelError
+	case "off", "none":
+		writer = io.Discard
 	case "":
 		return
 	default:
@@ -215,9 +226,17 @@ func initLoggingFromEnv(db adbc.Database) {
 		return
 	}
 
-	h := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+	h := slog.NewJSONHandler(writer, &slog.HandlerOptions{
 		AddSource: false,
 		Level:     logLevel,
+		ReplaceAttr: func(_ []string, attr slog.Attr) slog.Attr {
+			if attr.Key == slog.LevelKey {
+				if level, ok := attr.Value.Any().(slog.Level); ok && level == logLevelTrace {
+					attr.Value = slog.StringValue("TRACE")
+				}
+			}
+			return attr
+		},
 	})
 	logger := slog.New(h)
 
@@ -230,7 +249,7 @@ func initLoggingFromEnv(db adbc.Database) {
 }
 
 func printLoggingHelp() {
-	fmt.Fprintf(os.Stderr, "FlightSQL: to enable logging, set %s to 'debug', 'info', 'warn', or 'error'", logLevelEnvVar)
+	fmt.Fprintf(os.Stderr, "FlightSQL: to enable logging, set %s to 'trace', 'debug', 'info', 'warn', 'error', or 'off'", logLevelEnvVar)
 }
 
 // cgo.Handle is a uintptr integer (not a pointer). Packing it directly into

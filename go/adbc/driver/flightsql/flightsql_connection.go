@@ -110,7 +110,10 @@ func (md *flightSqlMetadata) SetXdbcIsAutoincrement(builder *array.BooleanBuilde
 	}
 }
 
-func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth, catalog *string, dbSchema *string, tableName *string, columnName *string, tableType []string) (array.RecordReader, error) {
+func (c *connectionImpl) GetObjects(ctx context.Context, depth adbc.ObjectDepth, catalog *string, dbSchema *string, tableName *string, columnName *string, tableType []string) (rdr array.RecordReader, err error) {
+	ctx, span := internal.StartSpan(ctx, "FlightSQL.Connection.GetObjects", c)
+	defer internal.EndSpan(span, err)
+
 	// To avoid an N+1 query problem, we assume result sets here will fit in memory and build up a single response.
 	g := internal.GetObjects{Ctx: ctx, Depth: depth, Catalog: catalog, DbSchema: dbSchema, TableName: tableName, ColumnName: columnName, TableType: tableType}
 	if err := g.Init(c.Base().Alloc, c.GetObjectsDbSchemas, c.GetObjectsTables, &flightSqlMetadata{}); err != nil {
@@ -881,7 +884,10 @@ func (c *connectionImpl) GetObjectsTables(ctx context.Context, depth adbc.Object
 	return
 }
 
-func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, dbSchema *string, tableName string) (*arrow.Schema, error) {
+func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, dbSchema *string, tableName string) (schema *arrow.Schema, err error) {
+	ctx, span := internal.StartSpan(ctx, "FlightSQL.Connection.GetTableSchema", c)
+	defer internal.EndSpan(span, err)
+
 	opts := &flightsql.GetTablesOpts{
 		Catalog:                catalog,
 		DbSchemaFilterPattern:  dbSchema,
@@ -960,7 +966,10 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 //	Field Name			| Field Type
 //	----------------|--------------
 //	table_type			| utf8 not null
-func (c *connectionImpl) GetTableTypes(ctx context.Context) (array.RecordReader, error) {
+func (c *connectionImpl) GetTableTypes(ctx context.Context) (rdr array.RecordReader, err error) {
+	ctx, span := internal.StartSpan(ctx, "FlightSQL.Connection.GetTableTypes", c)
+	defer internal.EndSpan(span, err)
+
 	ctx = metadata.NewOutgoingContext(ctx, c.hdrs)
 	var header, trailer metadata.MD
 	info, err := c.cl.GetTableTypes(ctx, c.timeouts, grpc.Header(&header), grpc.Trailer(&trailer))
@@ -977,10 +986,13 @@ func (c *connectionImpl) GetTableTypes(ctx context.Context) (array.RecordReader,
 // Behavior is undefined if this is mixed with SQL transaction statements.
 // When not supported, the convention is that it should act as if autocommit
 // is enabled and return INVALID_STATE errors.
-func (c *connectionImpl) Commit(ctx context.Context) error {
+func (c *connectionImpl) Commit(ctx context.Context) (err error) {
+	ctx, span := internal.StartSpan(ctx, "FlightSQL.Connection.Commit", c)
+	defer internal.EndSpan(span, err)
+
 	ctx = metadata.NewOutgoingContext(ctx, c.hdrs)
 	var header, trailer metadata.MD
-	err := c.txn.Commit(ctx, c.timeouts, grpc.Header(&header), grpc.Trailer(&trailer))
+	err = c.txn.Commit(ctx, c.timeouts, grpc.Header(&header), grpc.Trailer(&trailer))
 	if err != nil {
 		return adbcFromFlightStatusWithDetails(err, header, trailer, "Commit")
 	}
@@ -1000,10 +1012,13 @@ func (c *connectionImpl) Commit(ctx context.Context) error {
 // Behavior is undefined if this is mixed with SQL transaction statements.
 // When not supported, the convention is that it should act as if autocommit
 // is enabled and return INVALID_STATE errors.
-func (c *connectionImpl) Rollback(ctx context.Context) error {
+func (c *connectionImpl) Rollback(ctx context.Context) (err error) {
+	ctx, span := internal.StartSpan(ctx, "FlightSQL.Connection.Rollback", c)
+	defer internal.EndSpan(span, err)
+
 	ctx = metadata.NewOutgoingContext(ctx, c.hdrs)
 	var header, trailer metadata.MD
-	err := c.txn.Rollback(ctx, c.timeouts, grpc.Header(&header), grpc.Trailer(&trailer))
+	err = c.txn.Rollback(ctx, c.timeouts, grpc.Header(&header), grpc.Trailer(&trailer))
 	if err != nil {
 		return adbcFromFlightStatusWithDetails(err, header, trailer, "Rollback")
 	}
@@ -1110,7 +1125,10 @@ func (c *connectionImpl) prepareSubstrait(ctx context.Context, plan flightsql.Su
 }
 
 // Close closes this connection and releases any associated resources.
-func (c *connectionImpl) Close() error {
+func (c *connectionImpl) Close() (err error) {
+	ctx, span := internal.StartSpan(context.Background(), "FlightSQL.Connection.Close", c)
+	defer internal.EndSpan(span, err)
+
 	if c.cl == nil {
 		return adbc.Error{
 			Msg:  "[Flight SQL Connection] trying to close already closed connection",
@@ -1118,9 +1136,9 @@ func (c *connectionImpl) Close() error {
 		}
 	}
 
-	ctx := metadata.NewOutgoingContext(context.Background(), c.hdrs)
+	ctx = metadata.NewOutgoingContext(ctx, c.hdrs)
 	var header, trailer metadata.MD
-	_, err := c.cl.CloseSession(ctx, &flight.CloseSessionRequest{}, grpc.Header(&header), grpc.Trailer(&trailer), c.timeouts)
+	_, err = c.cl.CloseSession(ctx, &flight.CloseSessionRequest{}, grpc.Header(&header), grpc.Trailer(&trailer), c.timeouts)
 	if err != nil {
 		grpcStatus := grpcstatus.Convert(err)
 		// Ignore unimplemented
@@ -1142,6 +1160,9 @@ func (c *connectionImpl) Close() error {
 //
 // A partition can be retrieved by using ExecutePartitions on a statement.
 func (c *connectionImpl) ReadPartition(ctx context.Context, serializedPartition []byte) (rdr array.RecordReader, err error) {
+	ctx, span := internal.StartSpan(ctx, "FlightSQL.Connection.ReadPartition", c)
+	defer internal.EndSpan(span, err)
+
 	var info flight.FlightInfo
 	if err := proto.Unmarshal(serializedPartition, &info); err != nil {
 		return nil, adbc.Error{

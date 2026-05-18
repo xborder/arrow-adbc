@@ -22,6 +22,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,11 @@ import (
 const (
 	driverNamespace    = "apache.arrow.adbc"
 	otelTracesExporter = "OTEL_TRACES_EXPORTER"
+
+	OptionKeyTracesExporter                       = "adbc.traces.exporter"
+	OptionKeyTracesExporterAdbcFileLocation       = "adbc.traces.exporter.adbcfile.location"
+	OptionKeyTracesExporterAdbcFileMaxTraceSizeKb = "adbc.traces.exporter.adbcfile.maxtracesizekb"
+	OptionKeyTracesExporterAdbcFileMaxTraceFiles  = "adbc.traces.exporter.adbcfile.maxtracefiles"
 )
 
 type traceExporterType int
@@ -69,9 +75,17 @@ func (te traceExporterType) String() string {
 	}[te]
 }
 
+type traceConfig struct {
+	Exporter       string
+	ExporterSet    bool
+	AdbcFilePath   string
+	AdbcFileSizeKb int64
+	AdbcFileCount  int
+}
+
 const (
 	DatabaseMessageOptionUnknown                   = "Unknown database option"
-	DatabaseMessageOtelTracesExporterOptionUnknown = "Unknown " + otelTracesExporter + " option"
+	DatabaseMessageOtelTracesExporterOptionUnknown = "Unknown trace exporter option"
 	DatabaseMessageNoOtelTracesExporters           = "No trace exporters added"
 )
 
@@ -100,30 +114,34 @@ type Database interface {
 // DatabaseImpl interface. It is meant to be used as a composite struct for a
 // driver's DatabaseImpl implementation.
 type DatabaseImplBase struct {
-	Alloc       memory.Allocator
-	ErrorHelper ErrorHelper
-	DriverInfo  *DriverInfo
-	Logger      *slog.Logger
-	Tracer      trace.Tracer
+	Alloc         memory.Allocator
+	ErrorHelper   ErrorHelper
+	DriverInfo    *DriverInfo
+	Logger        *slog.Logger
+	Tracer        trace.Tracer
+	TraceProvider trace.TracerProvider
 
-	tracerShutdownFunc func(context.Context) error
-	traceParent        string
+	loggerConfigured        bool
+	loggerShutdownFunc      func() error
+	tracerShutdownFunc      func(context.Context) error
+	traceWriterShutdownFunc func() error
+	traceParent             string
+	traceConfig             traceConfig
 }
 
 // NewDatabaseImplBase instantiates DatabaseImplBase.
 //
 //   - driver is a DriverImplBase containing the common resources from the parent
 //     driver, allowing the Arrow allocator and error handler to be reused.
-func NewDatabaseImplBase(ctx context.Context, driver *DriverImplBase) (DatabaseImplBase, error) {
+func NewDatabaseImplBase(_ context.Context, driver *DriverImplBase) (DatabaseImplBase, error) {
 	database := DatabaseImplBase{
 		Alloc:       driver.Alloc,
 		ErrorHelper: driver.ErrorHelper,
 		DriverInfo:  driver.DriverInfo,
 		Logger:      nilLogger(),
-		Tracer:      nilTracer(),
+		Tracer:      otel.Tracer(driverNamespace + "." + driver.DriverInfo.GetName()),
 	}
-	err := database.InitTracing(ctx, driver.DriverInfo.GetName(), getDriverVersion(driver.DriverInfo))
-	return database, err
+	return database, nil
 }
 
 func (base *DatabaseImplBase) Base() *DatabaseImplBase {
@@ -131,6 +149,25 @@ func (base *DatabaseImplBase) Base() *DatabaseImplBase {
 }
 
 func (base *DatabaseImplBase) GetOption(key string) (string, error) {
+	switch key {
+	case OptionKeyTracesExporter:
+		if base.traceConfig.ExporterSet {
+			return base.traceConfig.Exporter, nil
+		}
+		return getExporterName(), nil
+	case OptionKeyTracesExporterAdbcFileLocation:
+		return base.traceConfig.AdbcFilePath, nil
+	case OptionKeyTracesExporterAdbcFileMaxTraceSizeKb:
+		if base.traceConfig.AdbcFileSizeKb == 0 {
+			return "", nil
+		}
+		return strconv.FormatInt(base.traceConfig.AdbcFileSizeKb, 10), nil
+	case OptionKeyTracesExporterAdbcFileMaxTraceFiles:
+		if base.traceConfig.AdbcFileCount == 0 {
+			return "", nil
+		}
+		return strconv.Itoa(base.traceConfig.AdbcFileCount), nil
+	}
 	return "", base.ErrorHelper.Errorf(adbc.StatusNotFound, "%s '%s'", DatabaseMessageOptionUnknown, key)
 }
 
@@ -143,10 +180,43 @@ func (base *DatabaseImplBase) GetOptionDouble(key string) (float64, error) {
 }
 
 func (base *DatabaseImplBase) GetOptionInt(key string) (int64, error) {
+	switch key {
+	case OptionKeyTracesExporterAdbcFileMaxTraceSizeKb:
+		return base.traceConfig.AdbcFileSizeKb, nil
+	case OptionKeyTracesExporterAdbcFileMaxTraceFiles:
+		return int64(base.traceConfig.AdbcFileCount), nil
+	}
 	return 0, base.ErrorHelper.Errorf(adbc.StatusNotFound, "%s '%s'", DatabaseMessageOptionUnknown, key)
 }
 
 func (base *DatabaseImplBase) SetOption(key string, val string) error {
+	switch key {
+	case OptionKeyTracesExporter:
+		value := strings.ToLower(strings.TrimSpace(val))
+		if _, ok := tryParseTraceExporterType(value); !ok {
+			return base.ErrorHelper.Errorf(adbc.StatusInvalidArgument, "%s '%s'", DatabaseMessageOtelTracesExporterOptionUnknown, val)
+		}
+		base.traceConfig.Exporter = value
+		base.traceConfig.ExporterSet = true
+		return nil
+	case OptionKeyTracesExporterAdbcFileLocation:
+		base.traceConfig.AdbcFilePath = val
+		return nil
+	case OptionKeyTracesExporterAdbcFileMaxTraceSizeKb:
+		parsed, err := strconv.ParseInt(val, 10, 64)
+		if err != nil || parsed <= 0 {
+			return base.ErrorHelper.Errorf(adbc.StatusInvalidArgument, "Invalid value for database option '%s': '%s' is not a positive integer", key, val)
+		}
+		base.traceConfig.AdbcFileSizeKb = parsed
+		return nil
+	case OptionKeyTracesExporterAdbcFileMaxTraceFiles:
+		parsed, err := strconv.Atoi(val)
+		if err != nil || parsed <= 0 {
+			return base.ErrorHelper.Errorf(adbc.StatusInvalidArgument, "Invalid value for database option '%s': '%s' is not a positive integer", key, val)
+		}
+		base.traceConfig.AdbcFileCount = parsed
+		return nil
+	}
 	return base.ErrorHelper.Errorf(adbc.StatusNotImplemented, "%s '%s'", DatabaseMessageOptionUnknown, key)
 }
 
@@ -159,6 +229,20 @@ func (base *DatabaseImplBase) SetOptionDouble(key string, val float64) error {
 }
 
 func (base *DatabaseImplBase) SetOptionInt(key string, val int64) error {
+	switch key {
+	case OptionKeyTracesExporterAdbcFileMaxTraceSizeKb:
+		if val <= 0 {
+			return base.ErrorHelper.Errorf(adbc.StatusInvalidArgument, "Invalid value for database option '%s': '%d' is not a positive integer", key, val)
+		}
+		base.traceConfig.AdbcFileSizeKb = val
+		return nil
+	case OptionKeyTracesExporterAdbcFileMaxTraceFiles:
+		if val <= 0 {
+			return base.ErrorHelper.Errorf(adbc.StatusInvalidArgument, "Invalid value for database option '%s': '%d' is not a positive integer", key, val)
+		}
+		base.traceConfig.AdbcFileCount = int(val)
+		return nil
+	}
 	return base.ErrorHelper.Errorf(adbc.StatusNotImplemented, "%s '%s'", DatabaseMessageOptionUnknown, key)
 }
 
@@ -168,8 +252,16 @@ func (base *database) Close() error {
 
 func (base *DatabaseImplBase) Close() (err error) {
 	if base.Base().tracerShutdownFunc != nil {
-		err = base.Base().tracerShutdownFunc(context.Background())
+		err = errors.Join(err, base.Base().tracerShutdownFunc(context.Background()))
 		base.Base().tracerShutdownFunc = nil
+	}
+	if base.Base().traceWriterShutdownFunc != nil {
+		err = errors.Join(err, base.Base().traceWriterShutdownFunc())
+		base.Base().traceWriterShutdownFunc = nil
+	}
+	if base.Base().loggerShutdownFunc != nil {
+		err = errors.Join(err, base.Base().loggerShutdownFunc())
+		base.Base().loggerShutdownFunc = nil
 	}
 	return
 }
@@ -183,6 +275,31 @@ func (base *DatabaseImplBase) SetOptions(options map[string]string) error {
 		if err := base.SetOption(key, val); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func IsTraceOption(key string) bool {
+	switch key {
+	case OptionKeyTracesExporter,
+		OptionKeyTracesExporterAdbcFileLocation,
+		OptionKeyTracesExporterAdbcFileMaxTraceSizeKb,
+		OptionKeyTracesExporterAdbcFileMaxTraceFiles:
+		return true
+	default:
+		return false
+	}
+}
+
+func (base *DatabaseImplBase) SetTraceOptions(options map[string]string) error {
+	for key, val := range options {
+		if !IsTraceOption(key) {
+			continue
+		}
+		if err := base.SetOption(key, val); err != nil {
+			return err
+		}
+		delete(options, key)
 	}
 	return nil
 }
@@ -221,25 +338,71 @@ func NewDatabase(impl DatabaseImpl) Database {
 }
 
 func (db *database) SetLogger(logger *slog.Logger) {
-	if logger != nil {
-		db.Base().Logger = logger
-	} else {
-		db.Base().Logger = nilLogger()
+	db.Base().SetLogger(logger)
+}
+
+func (db *database) IsLoggerConfigured() bool {
+	return db.Base().IsLoggerConfigured()
+}
+
+func (base *DatabaseImplBase) SetLogger(logger *slog.Logger) {
+	base.SetLoggerWithShutdown(logger, nil)
+}
+
+func (base *DatabaseImplBase) SetLoggerWithShutdown(logger *slog.Logger, shutdown func() error) {
+	if base.loggerShutdownFunc != nil {
+		_ = base.loggerShutdownFunc()
 	}
+	if logger != nil {
+		base.Logger = logger
+	} else {
+		base.Logger = nilLogger()
+	}
+	base.loggerShutdownFunc = shutdown
+	base.loggerConfigured = true
+}
+
+func (base *DatabaseImplBase) IsLoggerConfigured() bool {
+	return base.loggerConfigured
 }
 
 func (base *database) InitTracing(ctx context.Context, driverName string, driverVersion string) error {
 	return base.Base().InitTracing(ctx, driverName, driverVersion)
 }
 
+func (base *DatabaseImplBase) ConfigureTracing(ctx context.Context) error {
+	return base.InitTracing(ctx, base.DriverInfo.GetName(), getDriverVersion(base.DriverInfo))
+}
+
 func (base *DatabaseImplBase) InitTracing(ctx context.Context, driverName string, driverVersion string) (err error) {
 	fullyQualifiedDriverName := driverNamespace + "." + driverName
 
-	exporterName := getExporterName()
+	if base.tracerShutdownFunc != nil {
+		err = base.tracerShutdownFunc(ctx)
+		base.tracerShutdownFunc = nil
+		if err != nil {
+			return
+		}
+	}
+	if base.traceWriterShutdownFunc != nil {
+		err = base.traceWriterShutdownFunc()
+		base.traceWriterShutdownFunc = nil
+		if err != nil {
+			return
+		}
+	}
+	base.TraceProvider = nil
+	base.Tracer = otel.Tracer(fullyQualifiedDriverName)
 
-	// Empty exporter
-	if exporterName == "" {
-		base.Tracer = otel.Tracer(fullyQualifiedDriverName)
+	var exporterName string
+	if base.traceConfig.ExporterSet {
+		exporterName = base.traceConfig.Exporter
+	} else {
+		exporterName = getExporterName()
+	}
+
+	// Empty or explicitly disabled exporter.
+	if exporterName == "" || exporterName == string(adbc.TelemetryExporterNone) {
 		return
 	}
 
@@ -258,6 +421,10 @@ func (base *DatabaseImplBase) InitTracing(ctx context.Context, driverName string
 		return
 	}
 
+	if exporterType == TraceExporterNone {
+		return
+	}
+
 	if len(exporters) < 1 {
 		// This should not normally happen after a successful call to getExporters,
 		// but here for completeness
@@ -270,7 +437,7 @@ func (base *DatabaseImplBase) InitTracing(ctx context.Context, driverName string
 		return
 	}
 
-	base.Tracer, err = newTracer(exporters, base, fullyQualifiedDriverName, driverVersion)
+	base.Tracer, base.TraceProvider, err = newTracer(exporters, base, fullyQualifiedDriverName, driverVersion)
 
 	return
 }
@@ -307,7 +474,7 @@ func getExporters(
 			return
 		}
 	case TraceExporterAdbcFile:
-		exporter, err = newAdbcFileExporter(driverName)
+		exporter, err = newAdbcFileExporter(driverName, base)
 		if err != nil {
 			return
 		}
@@ -328,14 +495,14 @@ func newTracer(
 	base *DatabaseImplBase,
 	fullyQualifiedDriverName string,
 	driverVersion string,
-) (tracer trace.Tracer, err error) {
-	var tracerProvider *sdktrace.TracerProvider
-	tracerProvider, err = newTracerProvider(exporters...)
+) (tracer trace.Tracer, tracerProvider trace.TracerProvider, err error) {
+	sdkTracerProvider, err := newTracerProvider(exporters...)
 	if err != nil {
 		return
 	}
-	base.Base().tracerShutdownFunc = tracerProvider.Shutdown
-	tracer = tracerProvider.Tracer(
+	base.Base().tracerShutdownFunc = sdkTracerProvider.Shutdown
+	tracerProvider = sdkTracerProvider
+	tracer = sdkTracerProvider.Tracer(
 		fullyQualifiedDriverName,
 		trace.WithInstrumentationVersion(driverVersion),
 		trace.WithSchemaURL(semconv.SchemaURL),
@@ -397,12 +564,18 @@ func newOtlpTraceExporters(ctx context.Context) ([]sdktrace.SpanExporter, error)
 	return []sdktrace.SpanExporter{grpcExporter, httpExporter}, nil
 }
 
-func newAdbcFileExporter(driverName string) (*stdouttrace.Exporter, error) {
+func newAdbcFileExporter(driverName string, base *DatabaseImplBase) (*stdouttrace.Exporter, error) {
 	fullyQualifiedDriverName := strings.ToLower(driverNamespace + "." + driverName)
-	fileWriter, err := NewRotatingFileWriter(WithLogNamePrefix(fullyQualifiedDriverName))
+	fileWriter, err := NewRotatingFileWriter(
+		WithTracingFolderPath(base.traceConfig.AdbcFilePath),
+		WithLogNamePrefix(fullyQualifiedDriverName),
+		WithFileSizeMaxKb(base.traceConfig.AdbcFileSizeKb),
+		WithFileCountMax(base.traceConfig.AdbcFileCount),
+	)
 	if err != nil {
 		return nil, err
 	}
+	base.traceWriterShutdownFunc = fileWriter.Close
 	return stdouttrace.New(stdouttrace.WithWriter(fileWriter))
 }
 

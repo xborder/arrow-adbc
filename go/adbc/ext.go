@@ -38,6 +38,14 @@ type DatabaseLogging interface {
 	SetLogger(*slog.Logger)
 }
 
+// DatabaseLoggingConfigured is a Database that can report whether logging was
+// configured through driver-specific options or environment fallbacks.
+//
+// EXPERIMENTAL. Not formally part of the ADBC APIs.
+type DatabaseLoggingConfigured interface {
+	IsLoggerConfigured() bool
+}
+
 // OTelTracingInit is a Database that also supports OpenTelemetry tracing.
 //
 // EXPERIMENTAL. Not formally part of the ADBC APIs.

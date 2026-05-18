@@ -29,15 +29,19 @@ import (
 	"time"
 
 	"github.com/apache/arrow-adbc/go/adbc"
+	"github.com/apache/arrow-adbc/go/adbc/driver/internal"
 	"github.com/apache/arrow-adbc/go/adbc/driver/internal/driverbase"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/bluele/gcache"
+	"go.opentelemetry.io/otel/propagation"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	grpcotelopts "google.golang.org/grpc/experimental/opentelemetry"
 	"google.golang.org/grpc/metadata"
+	grpcotel "google.golang.org/grpc/stats/opentelemetry"
 )
 
 type dbDialOpts struct {
@@ -76,6 +80,13 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 
 	for k, v := range cnOptions {
 		d.options[k] = v
+	}
+
+	if err := d.configureLogging(cnOptions); err != nil {
+		return err
+	}
+	if err := d.DatabaseImplBase.SetTraceOptions(cnOptions); err != nil {
+		return err
 	}
 
 	if authority, ok := cnOptions[OptionAuthority]; ok {
@@ -405,6 +416,14 @@ func getFlightClient(ctx context.Context, loc string, d *databaseImpl, authMiddl
 	dv, _ := d.DriverInfo.GetInfoForInfoCode(adbc.InfoDriverVersion)
 	driverVersion := dv.(string)
 	dialOpts := append(d.dialOpts.opts, grpc.WithConnectParams(d.timeout.connectParams()), grpc.WithTransportCredentials(creds), grpc.WithUserAgent("ADBC Flight SQL Driver "+driverVersion))
+	if d.TraceProvider != nil {
+		dialOpts = append(dialOpts, grpcotel.DialOption(grpcotel.Options{
+			TraceOptions: grpcotelopts.TraceOptions{
+				TracerProvider:    d.TraceProvider,
+				TextMapPropagator: propagation.TraceContext{},
+			},
+		}))
+	}
 	dialOpts = append(dialOpts, d.userDialOpts...)
 
 	if d.oauthToken != nil {
@@ -452,7 +471,10 @@ type support struct {
 	transactions bool
 }
 
-func (d *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
+func (d *databaseImpl) Open(ctx context.Context) (cnxn adbc.Connection, err error) {
+	ctx, span := internal.StartSpan(ctx, "FlightSQL.Database.Open", d)
+	defer internal.EndSpan(span, err)
+
 	authMiddle := &bearerAuthMiddleware{hdrs: d.hdrs.Copy()}
 	var cookies flight.CookieMiddleware
 	if d.enableCookies {
@@ -550,11 +572,12 @@ func (d *databaseImpl) Open(ctx context.Context) (adbc.Connection, error) {
 		ConnectionImplBase: driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
 	}
 
-	return driverbase.NewConnectionBuilder(conn).
+	cnxn = driverbase.NewConnectionBuilder(conn).
 		WithDriverInfoPreparer(conn).
 		WithAutocommitSetter(conn).
 		WithCurrentNamespacer(conn).
-		Connection(), nil
+		Connection()
+	return cnxn, nil
 }
 
 type bearerAuthMiddleware struct {

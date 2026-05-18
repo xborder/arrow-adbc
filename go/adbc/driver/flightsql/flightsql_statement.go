@@ -28,12 +28,14 @@ import (
 	"unsafe"
 
 	"github.com/apache/arrow-adbc/go/adbc"
+	"github.com/apache/arrow-adbc/go/adbc/driver/internal"
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/bluele/gcache"
+	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
@@ -214,6 +216,11 @@ func (s *statement) poll(ctx context.Context, opts ...grpc.CallOption) (*flight.
 //
 // A statement instance should not be used after Close is called.
 func (s *statement) Close() (err error) {
+	if s.cnxn != nil {
+		_, span := internal.StartSpan(context.Background(), "FlightSQL.Statement.Close", s.cnxn)
+		defer internal.EndSpan(span, err)
+	}
+
 	if s.prepared != nil {
 		err = s.closePreparedStatement()
 		s.prepared = nil
@@ -499,6 +506,12 @@ func (s *statement) SetSqlQuery(query string) error {
 //
 // This invalidates any prior result sets on this statement.
 func (s *statement) ExecuteQuery(ctx context.Context) (rdr array.RecordReader, nrec int64, err error) {
+	ctx, span := internal.StartSpan(ctx, "FlightSQL.Statement.ExecuteQuery", s.cnxn)
+	defer func() {
+		span.SetAttributes(attribute.Int64("adbc.rows_affected", nrec))
+		internal.EndSpan(span, err)
+	}()
+
 	if err := s.clearIncrementalQuery(); err != nil {
 		return nil, -1, err
 	}
@@ -531,6 +544,12 @@ func (s *statement) ExecuteQuery(ctx context.Context) (rdr array.RecordReader, n
 // ExecuteUpdate executes a statement that does not generate a result
 // set. It returns the number of rows affected if known, otherwise -1.
 func (s *statement) ExecuteUpdate(ctx context.Context) (n int64, err error) {
+	ctx, span := internal.StartSpan(ctx, "FlightSQL.Statement.ExecuteUpdate", s.cnxn)
+	defer func() {
+		span.SetAttributes(attribute.Int64("adbc.rows_affected", n))
+		internal.EndSpan(span, err)
+	}()
+
 	if err := s.clearIncrementalQuery(); err != nil {
 		return -1, err
 	}
@@ -558,7 +577,10 @@ func (s *statement) ExecuteUpdate(ctx context.Context) (n int64, err error) {
 
 // Prepare turns this statement into a prepared statement to be executed
 // multiple times. This invalidates any prior result sets.
-func (s *statement) Prepare(ctx context.Context) error {
+func (s *statement) Prepare(ctx context.Context) (err error) {
+	ctx, span := internal.StartSpan(ctx, "FlightSQL.Statement.Prepare", s.cnxn)
+	defer internal.EndSpan(span, err)
+
 	ctx = metadata.NewOutgoingContext(ctx, s.hdrs)
 	var header, trailer metadata.MD
 	prep, err := s.query.prepare(ctx, s.cnxn, grpc.Header(&header), grpc.Trailer(&trailer), s.timeouts)
@@ -702,15 +724,21 @@ func (s *statement) GetParameterSchema() (*arrow.Schema, error) {
 //
 // If the driver does not support partitioned results, this will return
 // an error with a StatusNotImplemented code.
-func (s *statement) ExecutePartitions(ctx context.Context) (*arrow.Schema, adbc.Partitions, int64, error) {
+func (s *statement) ExecutePartitions(ctx context.Context) (sc *arrow.Schema, out adbc.Partitions, nrec int64, err error) {
+	ctx, span := internal.StartSpan(ctx, "FlightSQL.Statement.ExecutePartitions", s.cnxn)
+	defer func() {
+		span.SetAttributes(
+			attribute.Int64("adbc.rows_affected", nrec),
+			attribute.Int64("adbc.partitions", int64(out.NumPartitions)),
+		)
+		internal.EndSpan(span, err)
+	}()
+
 	ctx = metadata.NewOutgoingContext(ctx, s.hdrs)
 
 	var (
 		info *flight.FlightInfo
 		poll *flight.PollInfo
-		out  adbc.Partitions
-		sc   *arrow.Schema
-		err  error
 	)
 
 	var header, trailer metadata.MD
@@ -824,6 +852,9 @@ func (s *statement) ExecutePartitions(ctx context.Context) (*arrow.Schema, adbc.
 
 // ExecuteSchema gets the schema of the result set of a query without executing it.
 func (s *statement) ExecuteSchema(ctx context.Context) (schema *arrow.Schema, err error) {
+	ctx, span := internal.StartSpan(ctx, "FlightSQL.Statement.ExecuteSchema", s.cnxn)
+	defer internal.EndSpan(span, err)
+
 	ctx = metadata.NewOutgoingContext(ctx, s.hdrs)
 
 	if s.prepared != nil {

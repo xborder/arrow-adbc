@@ -66,6 +66,12 @@ const (
 	OptionBoolSessionOptionPrefix       = "adbc.flight.sql.session.optionbool."
 	OptionStringListSessionOptionPrefix = "adbc.flight.sql.session.optionstringlist."
 	OptionLastFlightInfo                = "adbc.flight.sql.statement.exec.last_flight_info"
+	OptionLoggingLevel                  = "adbc.flight.sql.client_option.logging.level"
+	OptionLoggingSink                   = "adbc.flight.sql.client_option.logging.sink"
+	OptionLoggingFileLocation           = "adbc.flight.sql.client_option.logging.file.location"
+	OptionLoggingFilePrefix             = "adbc.flight.sql.client_option.logging.file.prefix"
+	OptionLoggingFileMaxSizeKb          = "adbc.flight.sql.client_option.logging.file.max_size_kb"
+	OptionLoggingFileMaxFiles           = "adbc.flight.sql.client_option.logging.file.max_files"
 	infoDriverName                      = "ADBC Flight SQL Driver - Go"
 
 	// Oauth2 options
@@ -130,6 +136,7 @@ func (d *driverImpl) NewDatabaseWithOptionsContext(ctx context.Context, opts map
 		}
 	}
 	delete(opts, adbc.OptionKeyURI)
+	applyLoggingEnvFallback(opts)
 
 	dbBase, err := driverbase.NewDatabaseImplBase(ctx, &d.DriverImplBase)
 	if err != nil {
@@ -155,6 +162,11 @@ func (d *driverImpl) NewDatabaseWithOptionsContext(ctx context.Context, opts map
 	db.options = make(map[string]string)
 
 	if err := db.SetOptions(opts); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if err := db.ConfigureTracing(ctx); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 
