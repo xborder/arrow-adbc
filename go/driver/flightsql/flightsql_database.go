@@ -35,6 +35,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
+	flightproto "github.com/apache/arrow-go/v18/arrow/flight/gen/flight"
 	"github.com/bluele/gcache"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel/attribute"
@@ -64,16 +65,17 @@ func (d *dbDialOpts) rebuild() {
 type databaseImpl struct {
 	driverbase.DatabaseImplBase
 
-	uri           *url.URL
-	creds         credentials.TransportCredentials
-	user, pass    string
-	hdrs          metadata.MD
-	timeout       timeoutOption
-	dialOpts      dbDialOpts
-	enableCookies bool
-	options       map[string]string
-	userDialOpts  []grpc.DialOption
-	oauthToken    credentials.PerRPCCredentials
+	uri               *url.URL
+	creds             credentials.TransportCredentials
+	user, pass        string
+	hdrs              metadata.MD
+	timeout           timeoutOption
+	dialOpts          dbDialOpts
+	enableCookies     bool
+	options           map[string]string
+	userDialOpts      []grpc.DialOption
+	oauthToken        credentials.PerRPCCredentials
+	usePollFlightInfo bool
 }
 
 func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
@@ -267,6 +269,18 @@ func (d *databaseImpl) SetOptions(cnOptions map[string]string) error {
 		delete(cnOptions, OptionCookieMiddleware)
 	}
 
+	if val, ok := cnOptions[OptionUsePollFlightInfo]; ok {
+		switch val {
+		case adbc.OptionValueEnabled:
+			d.usePollFlightInfo = true
+		case adbc.OptionValueDisabled:
+			d.usePollFlightInfo = false
+		default:
+			return d.ErrorHelper.Errorf(adbc.StatusInvalidArgument, "Invalid value for database option '%s': '%s'", OptionUsePollFlightInfo, val)
+		}
+		delete(cnOptions, OptionUsePollFlightInfo)
+	}
+
 	for key, val := range cnOptions {
 		if strings.HasPrefix(key, OptionRPCCallHeaderPrefix) {
 			d.hdrs.Append(strings.TrimPrefix(key, OptionRPCCallHeaderPrefix), val)
@@ -288,6 +302,11 @@ func (d *databaseImpl) GetOption(key string) (string, error) {
 		return d.timeout.updateTimeout.String(), nil
 	case OptionTimeoutConnect:
 		return d.timeout.connectTimeout.String(), nil
+	case OptionUsePollFlightInfo:
+		if d.usePollFlightInfo {
+			return adbc.OptionValueEnabled, nil
+		}
+		return adbc.OptionValueDisabled, nil
 	}
 	if val, ok := d.options[key]; ok {
 		return val, nil
@@ -334,6 +353,16 @@ func (d *databaseImpl) SetOption(key, value string) error {
 	switch key {
 	case OptionTimeoutFetch, OptionTimeoutQuery, OptionTimeoutUpdate, OptionTimeoutConnect:
 		return d.timeout.setTimeoutString(key, value)
+	case OptionUsePollFlightInfo:
+		switch value {
+		case adbc.OptionValueEnabled:
+			d.usePollFlightInfo = true
+		case adbc.OptionValueDisabled:
+			d.usePollFlightInfo = false
+		default:
+			return d.ErrorHelper.Errorf(adbc.StatusInvalidArgument, "Invalid value for database option '%s': '%s'", key, value)
+		}
+		return nil
 	}
 	if strings.HasPrefix(key, OptionRPCCallHeaderPrefix) {
 		d.hdrs.Set(strings.TrimPrefix(key, OptionRPCCallHeaderPrefix), value)
@@ -600,9 +629,25 @@ func (d *databaseImpl) Open(ctx context.Context) (_ adbc.Connection, err error) 
 		closeCachedFlightClient(d, location, client, "purged")
 	}).Build()
 
+	conn := &connectionImpl{
+		cl: cl, db: d, clientCache: cache,
+		hdrs: make(metadata.MD), timeouts: d.timeout,
+		ConnectionImplBase: driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
+	}
+	conn.pollCapabilities.enabled.Store(d.usePollFlightInfo)
+	// Stamp a stable per-connection ID onto every log line emitted by this
+	// connection (and any statements derived from it).
+	conn.id = newRandomID("conn")
+	conn.openedAt = time.Now()
+
 	var cnxnSupport support
 
-	info, err := cl.GetSqlInfo(ctx, []flightsql.SqlInfo{flightsql.SqlInfoFlightSqlServerTransaction}, d.timeout)
+	transactionInfo := []flightsql.SqlInfo{flightsql.SqlInfoFlightSqlServerTransaction}
+	info, err := conn.pollCommand(ctx, pollFamilySQLInfo,
+		&flightproto.CommandGetSqlInfo{Info: []uint32{uint32(flightsql.SqlInfoFlightSqlServerTransaction)}},
+		func(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+			return cl.GetSqlInfo(ctx, transactionInfo, opts...)
+		}, d.timeout)
 	// ignore this if it fails
 	if err == nil {
 		const int32code = 3
@@ -642,15 +687,7 @@ func (d *databaseImpl) Open(ctx context.Context) (_ adbc.Connection, err error) 
 		}
 	}
 
-	conn := &connectionImpl{
-		cl: cl, db: d, clientCache: cache,
-		hdrs: make(metadata.MD), timeouts: d.timeout, supportInfo: cnxnSupport,
-		ConnectionImplBase: driverbase.NewConnectionImplBase(&d.DatabaseImplBase),
-	}
-	// Stamp a stable per-connection ID onto every log line emitted by
-	// this connection (and any statements derived from it).
-	conn.id = newRandomID("conn")
-	conn.openedAt = time.Now()
+	conn.supportInfo = cnxnSupport
 	span.AddEvent("finished", trace.WithAttributes(
 		attribute.String("target", d.uri.String()),
 		attribute.Bool("transactionsSupported", cnxnSupport.transactions),
