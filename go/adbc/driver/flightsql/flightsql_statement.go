@@ -190,7 +190,19 @@ type statement struct {
 func (s *statement) closePreparedStatement() error {
 	var header, trailer metadata.MD
 	err := s.prepared.Close(metadata.NewOutgoingContext(context.Background(), s.hdrs), grpc.Header(&header), grpc.Trailer(&trailer), s.timeouts)
+	s.clearBoundParameters()
 	return adbcFromFlightStatusWithDetails(err, header, trailer, "ClosePreparedStatement")
+}
+
+func (s *statement) clearBoundParameters() {
+	if s.bound != nil {
+		s.bound.Release()
+		s.bound = nil
+	}
+	if s.streamBind != nil {
+		s.streamBind.Release()
+		s.streamBind = nil
+	}
 }
 
 func (s *statement) clearIncrementalQuery() error {
@@ -215,6 +227,57 @@ func (s *statement) poll(ctx context.Context, opts ...grpc.CallOption) (*flight.
 	return s.query.poll(ctx, s.cnxn, s.incrementalState.retryDescriptor, opts...)
 }
 
+func (s *statement) executeQueryInfo(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+	if s.prepared != nil {
+		return s.cnxn.pollToCompletion(ctx, pollFamilyPrepared, s.timeouts.queryTimeout,
+			func(ctx context.Context, retry *flight.FlightDescriptor, opts ...grpc.CallOption) (*flight.PollInfo, error) {
+				return s.prepared.ExecutePoll(ctx, retry, opts...)
+			},
+			s.prepared.Execute,
+			s.executePreparedAfterUnsupportedPoll,
+			opts...)
+	}
+	if s.query.sqlQuery != "" {
+		return s.cnxn.pollToCompletion(ctx, pollFamilyStatementSQL, s.timeouts.queryTimeout,
+			func(ctx context.Context, retry *flight.FlightDescriptor, opts ...grpc.CallOption) (*flight.PollInfo, error) {
+				return s.cnxn.poll(ctx, s.query.sqlQuery, retry, opts...)
+			},
+			func(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+				return s.cnxn.execute(ctx, s.query.sqlQuery, opts...)
+			}, nil, opts...)
+	}
+	if s.query.substraitPlan != nil {
+		plan := flightsql.SubstraitPlan{Plan: s.query.substraitPlan, Version: s.query.substraitVersion}
+		return s.cnxn.pollToCompletion(ctx, pollFamilyStatementSubstrait, s.timeouts.queryTimeout,
+			func(ctx context.Context, retry *flight.FlightDescriptor, opts ...grpc.CallOption) (*flight.PollInfo, error) {
+				return s.cnxn.pollSubstrait(ctx, plan, retry, opts...)
+			},
+			func(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+				return s.cnxn.executeSubstrait(ctx, plan, opts...)
+			}, nil, opts...)
+	}
+	return nil, adbc.Error{
+		Code: adbc.StatusInvalidState,
+		Msg:  "[Flight SQL Statement] cannot call ExecuteQuery without a query or prepared statement",
+	}
+}
+
+// ExecutePoll binds prepared parameters before issuing its initial poll. If
+// that poll alone reports UNIMPLEMENTED, clear the already-applied client-side
+// binding while GetFlightInfo runs, then restore it for statement reuse. This
+// prevents the fallback from sending the same bind twice.
+func (s *statement) executePreparedAfterUnsupportedPoll(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+	s.prepared.SetParameters(nil)
+	defer func() {
+		if s.bound != nil {
+			s.prepared.SetParameters(s.bound)
+		} else if s.streamBind != nil {
+			s.prepared.SetRecordReader(s.streamBind)
+		}
+	}()
+	return s.prepared.Execute(ctx, opts...)
+}
+
 // Close releases any relevant resources associated with this statement
 // and closes it (particularly if it is a prepared statement).
 //
@@ -232,14 +295,7 @@ func (s *statement) Close() (err error) {
 		}
 	}
 
-	if s.bound != nil {
-		s.bound.Release()
-		s.bound = nil
-	}
-	if s.streamBind != nil {
-		s.streamBind.Release()
-		s.streamBind = nil
-	}
+	s.clearBoundParameters()
 
 	s.clientCache = nil
 	s.cnxn = nil
@@ -556,11 +612,7 @@ func (s *statement) ExecuteQuery(ctx context.Context) (rdr array.RecordReader, n
 	var info *flight.FlightInfo
 	var header, trailer metadata.MD
 	opts := append([]grpc.CallOption{}, grpc.Header(&header), grpc.Trailer(&trailer), s.timeouts)
-	if s.prepared != nil {
-		info, err = s.prepared.Execute(ctx, opts...)
-	} else {
-		info, err = s.query.execute(ctx, s.cnxn, opts...)
-	}
+	info, err = s.executeQueryInfo(ctx, opts...)
 
 	defer func() {
 		finishAttrs := []attribute.KeyValue{
@@ -723,6 +775,7 @@ func (s *statement) Bind(_ context.Context, values arrow.RecordBatch) error {
 		return nil
 	}
 
+	s.setBound(values)
 	s.prepared.SetParameters(values)
 	return nil
 }
@@ -752,6 +805,7 @@ func (s *statement) BindStream(_ context.Context, stream array.RecordReader) err
 		return nil
 	}
 
+	s.setStreamBound(stream)
 	s.prepared.SetRecordReader(stream)
 	return nil
 }

@@ -962,6 +962,16 @@ func (srv *IncrementalPollTestServer) PollFlightInfo(ctx context.Context, desc *
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 
+	// This generic handler is for the opaque continuation descriptors below.
+	// Initial command descriptors from other Flight SQL families must report
+	// UNIMPLEMENTED so clients can apply the protocol-defined fallback.
+	var command anypb.Any
+	if err := proto.Unmarshal(desc.Cmd, &command); err == nil {
+		if _, err := command.UnmarshalNew(); err == nil {
+			return nil, status.Error(codes.Unimplemented, "PollFlightInfo command family not implemented")
+		}
+	}
+
 	var val wrapperspb.StringValue
 	var err error
 	if err = proto.Unmarshal(desc.Cmd, &val); err != nil {

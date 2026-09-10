@@ -52,12 +52,13 @@ type connectionImpl struct {
 
 	cl *flightsql.Client
 
-	db          *databaseImpl
-	clientCache gcache.Cache
-	hdrs        metadata.MD
-	timeouts    timeoutOption
-	txn         *flightsql.Txn
-	supportInfo support
+	db               *databaseImpl
+	clientCache      gcache.Cache
+	hdrs             metadata.MD
+	timeouts         timeoutOption
+	txn              *flightsql.Txn
+	supportInfo      support
+	pollCapabilities pollCapabilityCache
 
 	// id is a short random identifier assigned at Open time and stamped
 	// onto every log record emitted by this connection.
@@ -519,6 +520,11 @@ func (c *connectionImpl) GetOption(key string) (string, error) {
 		return c.timeouts.queryTimeout.String(), nil
 	case OptionTimeoutUpdate:
 		return c.timeouts.updateTimeout.String(), nil
+	case OptionUsePollFlightInfo:
+		if c.pollCapabilities.enabled.Load() {
+			return adbc.OptionValueEnabled, nil
+		}
+		return adbc.OptionValueDisabled, nil
 	case OptionSessionOptions:
 		options, err := c.getSessionOptions(context.Background())
 		if err != nil {
@@ -664,6 +670,16 @@ func (c *connectionImpl) SetOption(key, value string) error {
 	switch key {
 	case OptionTimeoutFetch, OptionTimeoutQuery, OptionTimeoutUpdate:
 		return c.timeouts.setTimeoutString(key, value)
+	case OptionUsePollFlightInfo:
+		switch value {
+		case adbc.OptionValueEnabled:
+			c.pollCapabilities.enabled.Store(true)
+		case adbc.OptionValueDisabled:
+			c.pollCapabilities.enabled.Store(false)
+		default:
+			return c.Base().ErrorHelper.Errorf(adbc.StatusInvalidArgument, "Invalid value for connection option '%s': '%s'", key, value)
+		}
+		return nil
 	}
 
 	switch {
@@ -759,7 +775,14 @@ func (c *connectionImpl) PrepareDriverInfo(ctx context.Context, infoCodes []adbc
 	ctx = metadata.NewOutgoingContext(ctx, c.hdrs)
 	var header, trailer metadata.MD
 	var info *flight.FlightInfo
-	info, err = c.cl.GetSqlInfo(ctx, translated, grpc.Header(&header), grpc.Trailer(&trailer), c.timeouts)
+	command := &flightproto.CommandGetSqlInfo{Info: make([]uint32, len(translated))}
+	for i, value := range translated {
+		command.Info[i] = uint32(value)
+	}
+	info, err = c.pollCommand(ctx, pollFamilySQLInfo, command,
+		func(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+			return c.cl.GetSqlInfo(ctx, translated, opts...)
+		}, grpc.Header(&header), grpc.Trailer(&trailer), c.timeouts)
 
 	// Just return local driver info if GetSqlInfo hasn't been implemented on the server
 	if grpcstatus.Code(err) == grpccodes.Unimplemented {
@@ -868,7 +891,10 @@ func (c *connectionImpl) GetObjectsCatalogs(ctx context.Context, catalog *string
 	)
 	ctx = metadata.NewOutgoingContext(ctx, c.hdrs)
 	// To avoid an N+1 query problem, we assume result sets here will fit in memory and build up a single response.
-	info, err := c.cl.GetCatalogs(ctx, grpc.Header(&header), grpc.Trailer(&trailer), c.timeouts)
+	info, err := c.pollCommand(ctx, pollFamilyCatalogs, &flightproto.CommandGetCatalogs{},
+		func(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+			return c.cl.GetCatalogs(ctx, opts...)
+		}, grpc.Header(&header), grpc.Trailer(&trailer), c.timeouts)
 	if err != nil {
 		return nil, adbcFromFlightStatusWithDetails(err, header, trailer, "GetObjects(GetCatalogs)")
 	}
@@ -918,7 +944,11 @@ func (c *connectionImpl) GetObjectsDbSchemas(ctx context.Context, depth adbc.Obj
 	var header, trailer metadata.MD
 	// Pre-populate the map of which schemas are in which catalogs
 	var info *flight.FlightInfo
-	info, err = c.cl.GetDBSchemas(ctx, &flightsql.GetDBSchemasOpts{DbSchemaFilterPattern: dbSchema}, grpc.Header(&header), grpc.Trailer(&trailer), c.timeouts)
+	command := &flightproto.CommandGetDbSchemas{DbSchemaFilterPattern: dbSchema}
+	info, err = c.pollCommand(ctx, pollFamilyDBSchemas, command,
+		func(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+			return c.cl.GetDBSchemas(ctx, (*flightsql.GetDBSchemasOpts)(command), opts...)
+		}, grpc.Header(&header), grpc.Trailer(&trailer), c.timeouts)
 	if err != nil {
 		return nil, adbcFromFlightStatusWithDetails(err, header, trailer, "GetObjects(GetDBSchemas)")
 	}
@@ -970,12 +1000,16 @@ func (c *connectionImpl) GetObjectsTables(ctx context.Context, depth adbc.Object
 	includeSchema := depth == adbc.ObjectDepthAll || depth == adbc.ObjectDepthColumns
 	var header, trailer metadata.MD
 	var info *flight.FlightInfo
-	info, err = c.cl.GetTables(ctx, &flightsql.GetTablesOpts{
+	command := &flightproto.CommandGetTables{
 		DbSchemaFilterPattern:  dbSchema,
 		TableNameFilterPattern: tableName,
 		TableTypes:             tableType,
 		IncludeSchema:          includeSchema,
-	}, grpc.Header(&header), grpc.Trailer(&trailer), c.timeouts)
+	}
+	info, err = c.pollCommand(ctx, pollFamilyTables, command,
+		func(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+			return c.cl.GetTables(ctx, (*flightsql.GetTablesOpts)(command), opts...)
+		}, grpc.Header(&header), grpc.Trailer(&trailer), c.timeouts)
 	if err != nil {
 		return nil, adbcFromFlightStatusWithDetails(err, header, trailer, "GetObjects(GetTables)")
 	}
@@ -1050,7 +1084,7 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 		endSpanHelper.WithError(err).EndSpan()
 	}()
 
-	opts := &flightsql.GetTablesOpts{
+	command := &flightproto.CommandGetTables{
 		Catalog:                catalog,
 		DbSchemaFilterPattern:  dbSchema,
 		TableNameFilterPattern: &tableName,
@@ -1060,7 +1094,10 @@ func (c *connectionImpl) GetTableSchema(ctx context.Context, catalog *string, db
 	ctx = metadata.NewOutgoingContext(ctx, c.hdrs)
 	var header, trailer metadata.MD
 	var info *flight.FlightInfo
-	info, err = c.cl.GetTables(ctx, opts, c.timeouts, grpc.Header(&header), grpc.Trailer(&trailer))
+	info, err = c.pollCommand(ctx, pollFamilyTables, command,
+		func(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+			return c.cl.GetTables(ctx, (*flightsql.GetTablesOpts)(command), opts...)
+		}, c.timeouts, grpc.Header(&header), grpc.Trailer(&trailer))
 	if err != nil {
 		return nil, adbcFromFlightStatusWithDetails(err, header, trailer, "GetTableSchema(GetTables)")
 	}
@@ -1140,7 +1177,10 @@ func (c *connectionImpl) GetTableTypes(ctx context.Context) (reader array.Record
 	ctx = metadata.NewOutgoingContext(ctx, c.hdrs)
 	var header, trailer metadata.MD
 	var info *flight.FlightInfo
-	info, err = c.cl.GetTableTypes(ctx, c.timeouts, grpc.Header(&header), grpc.Trailer(&trailer))
+	info, err = c.pollCommand(ctx, pollFamilyTableTypes, &flightproto.CommandGetTableTypes{},
+		func(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+			return c.cl.GetTableTypes(ctx, opts...)
+		}, c.timeouts, grpc.Header(&header), grpc.Trailer(&trailer))
 	if err != nil {
 		return nil, adbcFromFlightStatusWithDetails(err, header, trailer, "GetTableTypes")
 	}
