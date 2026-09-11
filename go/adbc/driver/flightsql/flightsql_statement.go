@@ -39,7 +39,9 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -190,7 +192,19 @@ type statement struct {
 func (s *statement) closePreparedStatement() error {
 	var header, trailer metadata.MD
 	err := s.prepared.Close(metadata.NewOutgoingContext(context.Background(), s.hdrs), grpc.Header(&header), grpc.Trailer(&trailer), s.timeouts)
+	s.clearBoundParameters()
 	return adbcFromFlightStatusWithDetails(err, header, trailer, "ClosePreparedStatement")
+}
+
+func (s *statement) clearBoundParameters() {
+	if s.bound != nil {
+		s.bound.Release()
+		s.bound = nil
+	}
+	if s.streamBind != nil {
+		s.streamBind.Release()
+		s.streamBind = nil
+	}
 }
 
 func (s *statement) clearIncrementalQuery() error {
@@ -215,11 +229,68 @@ func (s *statement) poll(ctx context.Context, opts ...grpc.CallOption) (*flight.
 	return s.query.poll(ctx, s.cnxn, s.incrementalState.retryDescriptor, opts...)
 }
 
+func (s *statement) executeQueryInfo(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+	if s.prepared != nil {
+		return s.cnxn.pollToCompletion(ctx, pollFamilyPrepared, s.timeouts.queryTimeout,
+			func(ctx context.Context, retry *flight.FlightDescriptor, opts ...grpc.CallOption) (*flight.PollInfo, error) {
+				return s.prepared.ExecutePoll(ctx, retry, opts...)
+			},
+			s.prepared.Execute,
+			s.executePreparedAfterUnsupportedPoll,
+			opts...)
+	}
+	if s.query.sqlQuery != "" {
+		return s.cnxn.pollToCompletion(ctx, pollFamilyStatementSQL, s.timeouts.queryTimeout,
+			func(ctx context.Context, retry *flight.FlightDescriptor, opts ...grpc.CallOption) (*flight.PollInfo, error) {
+				return s.cnxn.poll(ctx, s.query.sqlQuery, retry, opts...)
+			},
+			func(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+				return s.cnxn.execute(ctx, s.query.sqlQuery, opts...)
+			}, nil, opts...)
+	}
+	if s.query.substraitPlan != nil {
+		plan := flightsql.SubstraitPlan{Plan: s.query.substraitPlan, Version: s.query.substraitVersion}
+		return s.cnxn.pollToCompletion(ctx, pollFamilyStatementSubstrait, s.timeouts.queryTimeout,
+			func(ctx context.Context, retry *flight.FlightDescriptor, opts ...grpc.CallOption) (*flight.PollInfo, error) {
+				return s.cnxn.pollSubstrait(ctx, plan, retry, opts...)
+			},
+			func(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+				return s.cnxn.executeSubstrait(ctx, plan, opts...)
+			}, nil, opts...)
+	}
+	return nil, adbc.Error{
+		Code: adbc.StatusInvalidState,
+		Msg:  "[Flight SQL Statement] cannot call ExecuteQuery without a query or prepared statement",
+	}
+}
+
+// ExecutePoll binds prepared parameters before issuing its initial poll. If
+// that poll alone reports UNIMPLEMENTED, clear the already-applied client-side
+// binding while GetFlightInfo runs, then restore it for statement reuse. This
+// prevents the fallback from sending the same bind twice.
+func (s *statement) executePreparedAfterUnsupportedPoll(ctx context.Context, opts ...grpc.CallOption) (*flight.FlightInfo, error) {
+	s.prepared.SetParameters(nil)
+	defer func() {
+		if s.bound != nil {
+			s.prepared.SetParameters(s.bound)
+		} else if s.streamBind != nil {
+			s.prepared.SetRecordReader(s.streamBind)
+		}
+	}()
+	return s.prepared.Execute(ctx, opts...)
+}
+
 // Close releases any relevant resources associated with this statement
 // and closes it (particularly if it is a prepared statement).
 //
 // A statement instance should not be used after Close is called.
 func (s *statement) Close() (err error) {
+	if s.cnxn != nil && s.incrementalState != nil && !s.incrementalState.complete {
+		if info := s.lastInfo.Load(); info != nil {
+			ctx := metadata.NewOutgoingContext(context.Background(), s.hdrs)
+			s.cnxn.cancelFlightInfoBestEffort(ctx, info)
+		}
+	}
 	if s.prepared != nil {
 		err = s.closePreparedStatement()
 		s.prepared = nil
@@ -232,14 +303,7 @@ func (s *statement) Close() (err error) {
 		}
 	}
 
-	if s.bound != nil {
-		s.bound.Release()
-		s.bound = nil
-	}
-	if s.streamBind != nil {
-		s.streamBind.Release()
-		s.streamBind = nil
-	}
+	s.clearBoundParameters()
 
 	s.clientCache = nil
 	s.cnxn = nil
@@ -556,11 +620,7 @@ func (s *statement) ExecuteQuery(ctx context.Context) (rdr array.RecordReader, n
 	var info *flight.FlightInfo
 	var header, trailer metadata.MD
 	opts := append([]grpc.CallOption{}, grpc.Header(&header), grpc.Trailer(&trailer), s.timeouts)
-	if s.prepared != nil {
-		info, err = s.prepared.Execute(ctx, opts...)
-	} else {
-		info, err = s.query.execute(ctx, s.cnxn, opts...)
-	}
+	info, err = s.executeQueryInfo(ctx, opts...)
 
 	defer func() {
 		finishAttrs := []attribute.KeyValue{
@@ -723,6 +783,7 @@ func (s *statement) Bind(_ context.Context, values arrow.RecordBatch) error {
 		return nil
 	}
 
+	s.setBound(values)
 	s.prepared.SetParameters(values)
 	return nil
 }
@@ -752,6 +813,7 @@ func (s *statement) BindStream(_ context.Context, stream array.RecordReader) err
 		return nil
 	}
 
+	s.setStreamBound(stream)
 	s.prepared.SetRecordReader(stream)
 	return nil
 }
@@ -836,6 +898,7 @@ func (s *statement) ExecutePartitions(ctx context.Context) (*arrow.Schema, adbc.
 		}
 
 		backoff := 100 * time.Millisecond
+	pollLoop:
 		for {
 			// Keep polling until the query completes or we get new partitions
 			poll, err = s.poll(ctx, grpc.Header(&header), grpc.Trailer(&trailer), s.timeouts)
@@ -853,7 +916,13 @@ func (s *statement) ExecutePartitions(ctx context.Context) (*arrow.Schema, adbc.
 					Code: adbc.StatusInternal,
 				}
 			}
-			info = proto.Clone(info).(*flight.FlightInfo)
+			cumulativeInfo := proto.Clone(info).(*flight.FlightInfo)
+			if err = validateIncrementalFlightInfo(s.incrementalState.previousInfo, cumulativeInfo); err != nil {
+				s.incrementalState.complete = true
+				s.incrementalState.retryDescriptor = nil
+				break
+			}
+			info = proto.Clone(cumulativeInfo).(*flight.FlightInfo)
 			// We only return the new endpoints each time
 			if s.incrementalState.previousInfo != nil {
 				offset := len(s.incrementalState.previousInfo.Endpoint)
@@ -863,10 +932,10 @@ func (s *statement) ExecutePartitions(ctx context.Context) (*arrow.Schema, adbc.
 					info.Endpoint = info.Endpoint[offset:]
 				}
 			}
-			s.incrementalState.previousInfo = poll.GetInfo()
+			s.incrementalState.previousInfo = cumulativeInfo
 			s.incrementalState.retryDescriptor = poll.GetFlightDescriptor()
 			atomicStoreFloat64(&s.progress, poll.GetProgress())
-			s.lastInfo.Store(poll.GetInfo())
+			s.lastInfo.Store(cumulativeInfo)
 
 			if s.incrementalState.retryDescriptor == nil {
 				// Query is finished
@@ -877,21 +946,26 @@ func (s *statement) ExecutePartitions(ctx context.Context) (*arrow.Schema, adbc.
 				break
 			}
 			// Back off before next poll
-			time.Sleep(backoff)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				code := codes.Canceled
+				if ctx.Err() == context.DeadlineExceeded {
+					code = codes.DeadlineExceeded
+				}
+				err = status.Error(code, ctx.Err().Error())
+				break pollLoop
+			case <-timer.C:
+			}
 			backoff *= 2
 			if backoff > 5000*time.Millisecond {
 				backoff = 5000 * time.Millisecond
 			}
 		}
 
-		// Special case: the query completed but there were no new endpoints. We
-		// return 0 new partitions, and also reset the statement (because
-		// returning 0 partitions implies completion)
-		if s.incrementalState.complete && len(info.Endpoint) == 0 {
-			s.incrementalState = &incrementalState{}
-			atomicStoreFloat64(&s.progress, 0.0)
-			s.lastInfo.Store(nil)
-		}
 	} else if s.prepared != nil {
 		info, err = s.prepared.Execute(ctx, grpc.Header(&header), grpc.Trailer(&trailer), s.timeouts)
 	} else {
@@ -899,7 +973,27 @@ func (s *statement) ExecutePartitions(ctx context.Context) (*arrow.Schema, adbc.
 	}
 
 	if err != nil {
+		if s.incrementalState != nil {
+			if ctx.Err() != nil {
+				if latest := s.lastInfo.Load(); latest != nil {
+					s.cnxn.cancelFlightInfoBestEffort(ctx, latest)
+				}
+			}
+			if status.Code(err) != codes.Unavailable {
+				s.incrementalState.complete = true
+				s.incrementalState.retryDescriptor = nil
+			}
+		}
 		return nil, out, -1, adbcFromFlightStatusWithDetails(err, header, trailer, "ExecutePartitions")
+	}
+
+	// Special case: the query completed but there were no new endpoints. We
+	// return 0 new partitions, and also reset the statement (because returning
+	// 0 partitions implies completion).
+	if s.incrementalState != nil && s.incrementalState.complete && len(info.Endpoint) == 0 {
+		s.incrementalState = &incrementalState{}
+		atomicStoreFloat64(&s.progress, 0.0)
+		s.lastInfo.Store(nil)
 	}
 
 	if len(info.Schema) > 0 {
@@ -930,6 +1024,21 @@ func (s *statement) ExecutePartitions(ctx context.Context) (*arrow.Schema, adbc.
 	}
 
 	return sc, out, info.TotalRecords, nil
+}
+
+func validateIncrementalFlightInfo(previous, current *flight.FlightInfo) error {
+	if previous == nil {
+		return nil
+	}
+	if len(current.Endpoint) < len(previous.Endpoint) {
+		return status.Error(codes.Internal, "PollInfo removed previously published endpoints")
+	}
+	for i := range previous.Endpoint {
+		if !proto.Equal(previous.Endpoint[i], current.Endpoint[i]) {
+			return status.Errorf(codes.Internal, "PollInfo mutated previously published endpoint %d", i)
+		}
+	}
+	return nil
 }
 
 // ExecuteSchema gets the schema of the result set of a query without executing it.

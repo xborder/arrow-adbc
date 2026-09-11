@@ -66,6 +66,7 @@ const (
 	OptionTimeoutFetch                  = "adbc.flight.sql.rpc.timeout_seconds.fetch"
 	OptionTimeoutQuery                  = "adbc.flight.sql.rpc.timeout_seconds.query"
 	OptionTimeoutUpdate                 = "adbc.flight.sql.rpc.timeout_seconds.update"
+	OptionUsePollFlightInfo             = "adbc.flight.sql.rpc.use_poll_flight_info"
 	OptionRPCCallHeaderPrefix           = "adbc.flight.sql.rpc.call_header."
 	OptionCookieMiddleware              = "adbc.flight.sql.rpc.with_cookie_middleware"
 	OptionSessionOptions                = "adbc.flight.sql.session.options"
@@ -166,8 +167,9 @@ func (d *driverImpl) NewDatabaseWithOptionsContext(ctx context.Context, opts map
 			// Match gRPC default
 			connectTimeout: time.Second * 20,
 		},
-		hdrs:         make(metadata.MD),
-		userDialOpts: userDialOpts,
+		hdrs:              make(metadata.MD),
+		userDialOpts:      userDialOpts,
+		usePollFlightInfo: true,
 	}
 
 	if db.uri, err = url.Parse(uri); err != nil {
