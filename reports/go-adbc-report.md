@@ -37,6 +37,83 @@ Go ADBC `GetObjects` does not invoke primary-key, foreign-key, cross-reference, 
 
 `ExecutePartitions` is intentionally excluded from synchronous reader routing. With incremental mode enabled, it continues returning new endpoints per call and retaining continuation/progress state. With incremental mode disabled, it continues producing serialized partition descriptors via its existing `GetFlightInfo` path. No production line in `statement.ExecutePartitions` or `incrementalState` changed.
 
+## Request flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor App as Go ADBC application
+    participant API as ADBC Statement / Connection
+    participant Poller as connectionImpl.pollToCompletion
+    participant Arrow as Arrow Go Flight SQL client
+    participant Server as Flight SQL server
+    participant Result as Existing ADBC reader / DoGet path
+
+    App->>API: ExecuteQuery / GetObjects / GetInfo
+    alt Incremental ExecutePartitions
+        API->>Arrow: Existing incremental polling state machine
+        Arrow->>Server: Existing partition/progress requests
+        Server-->>Arrow: New endpoints / continuation / progress
+        Arrow-->>App: Serialized partitions; behavior unchanged
+    else Normal query or metadata result
+        API->>Poller: Command descriptor + one caller context
+        opt Prepared statement with binding
+            Poller->>Arrow: ExecutePoll with bound record or reader
+            Arrow->>Server: DoPut(bound parameters) exactly once
+            Server-->>Arrow: Bound prepared handle
+        end
+        alt PollInfo disabled or family cached unsupported
+            Poller->>Arrow: Existing GetFlightInfo path
+            Arrow->>Server: GetFlightInfo(original descriptor)
+            Server-->>Arrow: Final FlightInfo
+            Arrow-->>Poller: Final FlightInfo
+        else PollInfo enabled
+            Poller->>Arrow: Poll original command
+            Arrow->>Server: PollFlightInfo(original descriptor)
+            alt Initial response is UNIMPLEMENTED
+                Server-->>Arrow: UNIMPLEMENTED
+                Poller->>Poller: Cache command family as unsupported
+                Note over Poller,Arrow: Prepared fallback suppresses a second bind
+                Poller->>Arrow: GetFlightInfo(original descriptor) once
+                Arrow->>Server: GetFlightInfo(original descriptor)
+                Server-->>Arrow: Final FlightInfo
+            else Error other than initial UNIMPLEMENTED
+                Server-->>Arrow: UNAVAILABLE / auth / query / continuation error
+                Arrow-->>Poller: Propagated gRPC status
+                Poller-->>App: ADBC error; no fallback
+            else Polling accepted
+                Server-->>Arrow: Cumulative PollInfo + continuation
+                Arrow-->>Poller: Cumulative PollInfo + continuation
+                loop While continuation exists
+                    Poller->>Arrow: Poll continuation with same context
+                    Arrow->>Server: PollFlightInfo(continuation descriptor)
+                    Server-->>Arrow: New cumulative PollInfo + next continuation
+                    Arrow-->>Poller: Updated cumulative state
+                end
+                alt Polling completes
+                    Poller->>Result: Final cumulative FlightInfo only
+                else Context deadline or cancellation during active poll
+                    App->>API: Cancel caller context
+                    API-->>Arrow: Context cancels active RPC
+                    opt A cumulative FlightInfo is known
+                        Poller-->>Server: Detached CancelFlightInfo(latest info), max 1s
+                    end
+                    Poller-->>App: ADBC timeout / cancellation error promptly
+                end
+            end
+        end
+        opt Final FlightInfo was produced
+            loop Each final endpoint
+                Result->>Server: DoGet(ticket)
+                Server-->>Result: Arrow record batches
+            end
+            Result-->>App: Existing ADBC schema, reader, and row count
+        end
+    end
+```
+
+Normal query and metadata execution use final-only synchronous polling. Incremental `ExecutePartitions` remains separate, prepared fallback does not bind twice, and detached server cancellation cannot delay prompt context cancellation beyond the caller-facing operation.
+
 ## T1-T10 results
 
 | Test | Status | Executable result |
