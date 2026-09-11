@@ -25,7 +25,9 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestPollToCompletionUsesOneOperationDeadline(t *testing.T) {
@@ -59,4 +61,17 @@ func TestPollToCompletionUsesOneOperationDeadline(t *testing.T) {
 	// A per-poll deadline reset would take roughly 160ms. Leave enough slack
 	// for loaded CI while still distinguishing the one-operation deadline.
 	require.Less(t, elapsed, 145*time.Millisecond)
+}
+
+func TestValidateIncrementalFlightInfoRequiresAppendOnlyEndpoints(t *testing.T) {
+	first := &flight.FlightEndpoint{Ticket: &flight.Ticket{Ticket: []byte("first")}}
+	second := &flight.FlightEndpoint{Ticket: &flight.Ticket{Ticket: []byte("second")}}
+	previous := &flight.FlightInfo{Endpoint: []*flight.FlightEndpoint{first}}
+
+	require.NoError(t, validateIncrementalFlightInfo(previous,
+		&flight.FlightInfo{Endpoint: []*flight.FlightEndpoint{proto.Clone(first).(*flight.FlightEndpoint), second}}))
+	err := validateIncrementalFlightInfo(previous,
+		&flight.FlightInfo{Endpoint: []*flight.FlightEndpoint{second}})
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.ErrorContains(t, err, "mutated previously published endpoint 0")
 }
