@@ -54,7 +54,7 @@ sequenceDiagram
         API->>Arrow: Existing incremental polling state machine
         Arrow->>Server: Existing partition/progress requests
         Server-->>Arrow: New endpoints / continuation / progress
-        Arrow-->>App: Serialized partitions; behavior unchanged
+        Arrow-->>App: Serialized partitions, behavior unchanged
     else Normal query or metadata result
         API->>Poller: Command descriptor + one caller context
         opt Prepared statement with binding
@@ -80,7 +80,7 @@ sequenceDiagram
             else Error other than initial UNIMPLEMENTED
                 Server-->>Arrow: UNAVAILABLE / auth / query / continuation error
                 Arrow-->>Poller: Propagated gRPC status
-                Poller-->>App: ADBC error; no fallback
+                Poller-->>App: ADBC error, no fallback
             else Polling accepted
                 Server-->>Arrow: Cumulative PollInfo + continuation
                 Arrow-->>Poller: Cumulative PollInfo + continuation
