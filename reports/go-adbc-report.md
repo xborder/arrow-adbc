@@ -4,7 +4,7 @@
 
 Go ADBC already has the right API split. Normal Flight SQL `ExecuteQuery` synchronously drains `PollFlightInfo` to completion, while opt-in incremental `ExecutePartitions` returns newly published endpoints across repeated calls so applications can download partitions before query completion. The POC preserves that split, adds append-only validation and cancellation cleanup to the incremental path, and does not change an ADBC public method, signature, or result type.
 
-**Verdict: Feasible with the existing API-specific split**
+**Verdict: Feasible transparently** through the existing API-specific split.
 
 ## Repository baseline
 
