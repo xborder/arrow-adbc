@@ -50,6 +50,11 @@ type conformanceSnapshot struct {
 	Counters          conformanceCounters            `json:"counters"`
 	CountersByFamily  map[string]conformanceCounters `json:"counters_by_family"`
 	ContinuationOrder []string                       `json:"continuation_order"`
+	Events            []conformanceEvent             `json:"events"`
+}
+
+type conformanceEvent struct {
+	Method string `json:"method"`
 }
 
 type conformanceHarness struct {
@@ -156,6 +161,36 @@ func executeConformanceQuery(t *testing.T, cnxn adbc.Connection, ctx context.Con
 	return scenarios, values, rdr.Err()
 }
 
+func readConformancePartition(t *testing.T, cnxn adbc.Connection, partition []byte) ([]string, []int64) {
+	t.Helper()
+	rdr, err := cnxn.ReadPartition(context.Background(), partition)
+	require.NoError(t, err)
+	defer rdr.Release()
+	var scenarios []string
+	var values []int64
+	for rdr.Next() {
+		record := rdr.RecordBatch()
+		names := record.Column(0).(*array.String)
+		numbers := record.Column(1).(*array.Int64)
+		for i := 0; i < int(record.NumRows()); i++ {
+			scenarios = append(scenarios, names.Value(i))
+			values = append(values, numbers.Value(i))
+		}
+	}
+	require.NoError(t, rdr.Err())
+	return scenarios, values
+}
+
+func pollAndGetEvents(snapshot conformanceSnapshot) []string {
+	var events []string
+	for _, event := range snapshot.Events {
+		if event.Method == "PollFlightInfo" || event.Method == "DoGet" {
+			events = append(events, event.Method)
+		}
+	}
+	return events
+}
+
 func TestPollInfoSharedConformance(t *testing.T) {
 	h := newConformanceHarness(t)
 
@@ -182,13 +217,25 @@ func TestPollInfoSharedConformance(t *testing.T) {
 		require.Equal(t, 1, state.CountersByFamily["direct"].OriginalDescriptors)
 	})
 
-	t.Run("T2MultiStep", func(t *testing.T) {
+	t.Run("T2IncrementalPartitionsConsumeBeforeNextPoll", func(t *testing.T) {
 		db, cnxn := h.open(nil)
 		defer closeConformance(t, db, cnxn)
-		scenarios, values, err := executeConformanceQuery(t, cnxn, context.Background(), "multi-step")
+		stmt, err := cnxn.NewStatement()
 		require.NoError(t, err)
-		require.Equal(t, []string{"multi-step", "multi-step", "multi-step"}, scenarios)
-		require.Equal(t, []int64{1, 2, 3}, values)
+		defer stmt.Close()
+		require.NoError(t, stmt.SetOption(adbc.OptionKeyIncremental, adbc.OptionValueEnabled))
+		require.NoError(t, stmt.SetSqlQuery("multi-step"))
+		for expected := int64(1); expected <= 3; expected++ {
+			_, partitions, _, err := stmt.ExecutePartitions(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, uint64(1), partitions.NumPartitions)
+			scenarios, values := readConformancePartition(t, cnxn, partitions.PartitionIDs[0])
+			require.Equal(t, []string{"multi-step"}, scenarios)
+			require.Equal(t, []int64{expected}, values)
+		}
+		_, partitions, _, err := stmt.ExecutePartitions(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, uint64(0), partitions.NumPartitions)
 		state := h.snapshot()
 		require.Equal(t, 3, state.CountersByFamily["direct"].PollFlightInfo)
 		require.Equal(t, 0, state.CountersByFamily["direct"].GetFlightInfo)
@@ -196,6 +243,21 @@ func TestPollInfoSharedConformance(t *testing.T) {
 		require.Equal(t, 2, state.CountersByFamily["direct"].ContinuationDescriptors)
 		require.Len(t, state.ContinuationOrder, 2)
 		require.NotEqual(t, state.ContinuationOrder[0], state.ContinuationOrder[1])
+		require.Equal(t,
+			[]string{"PollFlightInfo", "DoGet", "PollFlightInfo", "DoGet", "PollFlightInfo", "DoGet"},
+			pollAndGetEvents(state))
+	})
+
+	t.Run("T2ExecuteQueryRemainsFinalOnly", func(t *testing.T) {
+		db, cnxn := h.open(nil)
+		defer closeConformance(t, db, cnxn)
+		_, values, err := executeConformanceQuery(t, cnxn, context.Background(), "multi-step")
+		require.NoError(t, err)
+		require.Equal(t, []int64{1, 2, 3}, values)
+		state := h.snapshot()
+		require.Equal(t,
+			[]string{"PollFlightInfo", "PollFlightInfo", "PollFlightInfo", "DoGet", "DoGet", "DoGet"},
+			pollAndGetEvents(state))
 	})
 
 	t.Run("T3Prepared", func(t *testing.T) {
@@ -337,6 +399,27 @@ func TestPollInfoSharedConformance(t *testing.T) {
 		require.Equal(t, 1, state.CountersByFamily["direct"].OriginalDescriptors)
 	})
 
+	t.Run("T7LateErrorAfterPublishedPartition", func(t *testing.T) {
+		db, cnxn := h.open(nil)
+		defer closeConformance(t, db, cnxn)
+		stmt, err := cnxn.NewStatement()
+		require.NoError(t, err)
+		defer stmt.Close()
+		require.NoError(t, stmt.SetOption(adbc.OptionKeyIncremental, adbc.OptionValueEnabled))
+		require.NoError(t, stmt.SetSqlQuery("late-error"))
+		_, partitions, _, err := stmt.ExecutePartitions(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, uint64(1), partitions.NumPartitions)
+		_, values := readConformancePartition(t, cnxn, partitions.PartitionIDs[0])
+		require.Equal(t, []int64{1}, values)
+		_, _, _, err = stmt.ExecutePartitions(context.Background())
+		require.Error(t, err)
+		state := h.snapshot()
+		require.Equal(t, 2, state.CountersByFamily["direct"].PollFlightInfo)
+		require.Equal(t, 0, state.CountersByFamily["direct"].GetFlightInfo)
+		require.Equal(t, 1, state.CountersByFamily["direct"].DoGet)
+	})
+
 	t.Run("T8OperationWideTimeout", func(t *testing.T) {
 		db, cnxn := h.open(nil)
 		defer closeConformance(t, db, cnxn)
@@ -359,13 +442,24 @@ func TestPollInfoSharedConformance(t *testing.T) {
 		require.Equal(t, 1, state.CountersByFamily["direct"].ActiveCallTerminations)
 	})
 
-	t.Run("T9ContextCancellationAndBestEffortCancel", func(t *testing.T) {
+	t.Run("T9IncrementalContextCancellationAndBestEffortCancel", func(t *testing.T) {
 		db, cnxn := h.open(nil)
 		defer closeConformance(t, db, cnxn)
+		stmt, err := cnxn.NewStatement()
+		require.NoError(t, err)
+		defer stmt.Close()
+		require.NoError(t, stmt.SetOption(adbc.OptionKeyIncremental, adbc.OptionValueEnabled))
+		require.NoError(t, stmt.SetSqlQuery("cancel-observable"))
+		_, partitions, _, err := stmt.ExecutePartitions(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, uint64(1), partitions.NumPartitions)
+		_, values := readConformancePartition(t, cnxn, partitions.PartitionIDs[0])
+		require.Equal(t, []int64{1, 2}, values)
+
 		ctx, cancel := context.WithCancel(context.Background())
 		time.AfterFunc(200*time.Millisecond, cancel)
 		started := time.Now()
-		_, _, err := executeConformanceQuery(t, cnxn, ctx, "cancel-observable")
+		_, _, _, err = stmt.ExecutePartitions(ctx)
 		require.Error(t, err)
 		var adbcErr adbc.Error
 		require.ErrorAs(t, err, &adbcErr)
@@ -386,5 +480,33 @@ func TestPollInfoSharedConformance(t *testing.T) {
 		require.Equal(t, 0, state.CountersByFamily["direct"].GetFlightInfo)
 		require.Equal(t, 1, state.Counters.Cancellation)
 		require.Equal(t, 1, state.CountersByFamily["direct"].ActiveCallTerminations)
+	})
+
+	t.Run("T9IncrementalStatementCloseAttemptsCancellation", func(t *testing.T) {
+		db, cnxn := h.open(nil)
+		defer closeConformance(t, db, cnxn)
+		stmt, err := cnxn.NewStatement()
+		require.NoError(t, err)
+		require.NoError(t, stmt.SetOption(adbc.OptionKeyIncremental, adbc.OptionValueEnabled))
+		require.NoError(t, stmt.SetSqlQuery("cancel-observable"))
+		_, partitions, _, err := stmt.ExecutePartitions(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, uint64(1), partitions.NumPartitions)
+		_, values := readConformancePartition(t, cnxn, partitions.PartitionIDs[0])
+		require.Equal(t, []int64{1, 2}, values)
+		require.NoError(t, stmt.Close())
+
+		deadline := time.Now().Add(2 * time.Second)
+		var state conformanceSnapshot
+		for time.Now().Before(deadline) {
+			state = h.snapshot()
+			if state.Counters.Cancellation > 0 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		require.Equal(t, 1, state.Counters.Cancellation)
+		require.Equal(t, 1, state.CountersByFamily["direct"].PollFlightInfo)
+		require.Equal(t, 1, state.CountersByFamily["direct"].DoGet)
 	})
 }
