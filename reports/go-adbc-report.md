@@ -1,3 +1,22 @@
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
 # BDX-645 Go ADBC PollInfo feasibility report
 
 ## Outcome
@@ -5,6 +24,8 @@
 Go ADBC already has the right API split. Normal Flight SQL `ExecuteQuery` synchronously drains `PollFlightInfo` to completion, while opt-in incremental `ExecutePartitions` returns newly published endpoints across repeated calls so applications can download partitions before query completion. The POC preserves that split, adds append-only validation and cancellation cleanup to the incremental path, and does not change an ADBC public method, signature, or result type.
 
 **Verdict: Feasible transparently** through the existing API-specific split.
+
+Production go/no-go, timeout-routing follow-ups and re-validation on current upstream: see `go-adbc-production-recommendation.md`.
 
 ## Repository baseline
 
@@ -122,14 +143,14 @@ This is a feasibility patch, not production hardening. It does not add adaptive 
 
 Production/test source:
 
-- `go/adbc/driver/flightsql/poll.go`
-- `go/adbc/driver/flightsql/flightsql_driver.go`
-- `go/adbc/driver/flightsql/flightsql_database.go`
-- `go/adbc/driver/flightsql/flightsql_connection.go`
-- `go/adbc/driver/flightsql/flightsql_statement.go`
-- `go/adbc/driver/flightsql/poll_test.go`
-- `go/adbc/driver/flightsql/poll_conformance_test.go`
-- `go/adbc/driver/flightsql/flightsql_adbc_server_test.go` (fixture correction: generic continuation handler returns `UNIMPLEMENTED` for unrelated initial command descriptors)
+- `go/driver/flightsql/poll.go`
+- `go/driver/flightsql/flightsql_driver.go`
+- `go/driver/flightsql/flightsql_database.go`
+- `go/driver/flightsql/flightsql_connection.go`
+- `go/driver/flightsql/flightsql_statement.go`
+- `go/driver/flightsql/poll_test.go`
+- `go/driver/flightsql/poll_conformance_test.go`
+- `go/driver/flightsql/flightsql_adbc_server_test.go` (fixture correction: generic continuation handler returns `UNIMPLEMENTED` for unrelated initial command descriptors)
 
 Evidence/deliverables:
 
